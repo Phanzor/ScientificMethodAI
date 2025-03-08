@@ -11,13 +11,13 @@ class StateRewardPredictor(nn.Module):
     def __init__(self, input_size=4, hidden_size=32, state_size=4, reward_size=1):
         super(StateRewardPredictor, self).__init__()
         self.shared = nn.Sequential(
-            nn.Linear(input_size + 1, hidden_size),  # Observation (4) + Action (1)
+            nn.Linear(input_size + 1, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU()
         )
-        self.state_head = nn.Linear(hidden_size, state_size)  # Predict next state
-        self.reward_head = nn.Linear(hidden_size, reward_size)  # Predict reward
+        self.state_head = nn.Linear(hidden_size, state_size)
+        self.reward_head = nn.Linear(hidden_size, reward_size)
     
     def forward(self, x):
         shared_out = self.shared(x)
@@ -32,12 +32,27 @@ optimizer = optim.Adam(predictor.parameters(), lr=0.001)
 state_criterion = nn.MSELoss()
 reward_criterion = nn.MSELoss()
 
-# Collect observations with curiosity-driven actions
-def collect_and_train(env, predictor, data_log, num_steps=100):
+# Hypothesis class to store and test causal rules
+class Hypothesis:
+    def __init__(self, condition, action, expected_effect):
+        self.condition = condition  # e.g., "pole angle > 0"
+        self.action = action        # e.g., 1 (right)
+        self.expected_effect = expected_effect  # e.g., "pole angle decreases"
+        self.confidence = 0.5       # Initial confidence
+    
+    def test(self, observation, predictor):
+        # Check if condition holds
+        if self.condition(observation):
+            pred_state, _ = generate_hypotheses(predictor, observation, self.action)
+            return pred_state  # Predicted next state for effect evaluation
+        return None
+
+# Collect observations with curiosity and hypothesis testing
+def collect_and_train(env, predictor, data_log, hypotheses, num_steps=100):
     observation, _ = env.reset()
     
     for _ in range(num_steps):
-        # Curiosity: Choose action with highest prediction uncertainty
+        # Curiosity: Choose action with highest uncertainty
         obs_tensor = torch.tensor(observation, dtype=torch.float32)
         actions = [0, 1]
         errors = []
@@ -46,18 +61,17 @@ def collect_and_train(env, predictor, data_log, num_steps=100):
                 act_tensor = torch.tensor([action], dtype=torch.float32)
                 input_tensor = torch.cat((obs_tensor, act_tensor))
                 pred_state, pred_reward = predictor(input_tensor)
-                # Dummy "target" for curiosity (simplified); use past data in practice
                 next_obs, reward, terminated, truncated, _ = env.step(action)
-                env.env.state = observation  # Reset to current state
+                env.env.state = observation
                 state_error = state_criterion(pred_state, torch.tensor(next_obs, dtype=torch.float32))
                 reward_error = reward_criterion(pred_reward, torch.tensor([reward], dtype=torch.float32))
                 errors.append(state_error.item() + reward_error.item())
                 if terminated or truncated:
                     observation, _ = env.reset()
         
-        action = actions[np.argmax(errors)]  # Pick action with highest error
+        action = actions[np.argmax(errors)]
         
-        # Step with chosen action
+        # Step and log
         next_observation, reward, terminated, truncated, _ = env.step(action)
         data_log.append({
             "observation": observation.copy(),
@@ -65,13 +79,25 @@ def collect_and_train(env, predictor, data_log, num_steps=100):
             "next_observation": next_observation.copy(),
             "reward": reward
         })
+        
+        # Test hypotheses
+        for h in hypotheses:
+            pred = h.test(observation, predictor)
+            if pred is not None:
+                actual_effect = next_observation[2] - observation[2]  # Pole angle change
+                expected_sign = -1 if "decreases" in h.expected_effect else 1
+                if np.sign(actual_effect) == expected_sign:
+                    h.confidence = min(1.0, h.confidence + 0.1)
+                else:
+                    h.confidence = max(0.0, h.confidence - 0.1)
+        
         observation = next_observation
         env.render()
         sleep(0.02)
         if terminated or truncated:
             observation, _ = env.reset()
     
-    # Train on all data
+    # Train
     for data in data_log:
         obs = torch.tensor(data["observation"], dtype=torch.float32)
         act = torch.tensor([data["action"]], dtype=torch.float32)
@@ -97,7 +123,7 @@ def generate_hypotheses(predictor, observation, action):
         act_tensor = torch.tensor([action], dtype=torch.float32)
         input_tensor = torch.cat((obs_tensor, act_tensor))
         pred_state, pred_reward = predictor(input_tensor)
-        return pred_state.numpy(), pred_reward.numpy()[0]
+        return pred_state, pred_reward
 
 # Test hypotheses
 def test_hypotheses(env, predictor, num_tests=10):
@@ -110,7 +136,7 @@ def test_hypotheses(env, predictor, num_tests=10):
         pred_state, pred_reward = generate_hypotheses(predictor, observation, action)
         
         next_observation, reward, terminated, truncated, _ = env.step(action)
-        state_error = np.mean((pred_state - next_observation) ** 2)
+        state_error = np.mean((pred_state - next_observation.numpy()) ** 2)
         reward_error = (pred_reward - reward) ** 2
         state_errors.append(state_error)
         reward_errors.append(reward_error)
@@ -124,7 +150,7 @@ def test_hypotheses(env, predictor, num_tests=10):
     return np.mean(state_errors), np.mean(reward_errors)
 
 # Learning loop
-def learning_loop(env, predictor, num_cycles=5, steps_per_cycle=200, tests_per_cycle=10):
+def learning_loop(env, predictor, hypotheses, num_cycles=5, steps_per_cycle=200, tests_per_cycle=10):
     data_log = []
     state_history = []
     reward_history = []
@@ -133,7 +159,7 @@ def learning_loop(env, predictor, num_cycles=5, steps_per_cycle=200, tests_per_c
         print(f"\nCycle {cycle + 1}/{num_cycles}")
         
         print("Collecting and training...")
-        data_log = collect_and_train(env, predictor, data_log, num_steps=steps_per_cycle)
+        data_log = collect_and_train(env, predictor, data_log, hypotheses, num_steps=steps_per_cycle)
         
         print("Testing hypotheses...")
         state_error, reward_error = test_hypotheses(env, predictor, num_tests=tests_per_cycle)
@@ -146,6 +172,11 @@ def learning_loop(env, predictor, num_cycles=5, steps_per_cycle=200, tests_per_c
             print("High error detected - focusing on exploration.")
         else:
             print("Low error - predictions are stabilizing.")
+        
+        # Print hypothesis confidence
+        print("Hypothesis Confidence:")
+        for h in hypotheses:
+            print(f"  {h.expected_effect} when {h.condition.__name__} (Action {h.action}): {h.confidence:.2f}")
     
     return state_history, reward_history
 
@@ -161,11 +192,32 @@ def plot_progress(state_history, reward_history):
 
 # Main execution
 def main():
-    print("Starting self-teaching AI with curiosity...")
-    state_history, reward_history = learning_loop(env, predictor, num_cycles=5, steps_per_cycle=200)
+    # Define some simple hypotheses
+    hypotheses = [
+        Hypothesis(
+            condition=lambda obs: obs[2] > 0,  # Pole tilted right
+            action=1,                          # Move right
+            expected_effect="pole angle decreases"
+        ),
+        Hypothesis(
+            condition=lambda obs: obs[2] < 0,  # Pole tilted left
+            action=0,                          # Move left
+            expected_effect="pole angle decreases"
+        )
+    ]
+    
+    print("Starting self-teaching AI with hypotheses...")
+    state_history, reward_history = learning_loop(env, predictor, hypotheses)
     print("\nFinal State History:", state_history)
     print("Final Reward History:", reward_history)
     plot_progress(state_history, reward_history)
+    
+    # Save the model
+    torch.save(predictor.state_dict(), "predictor.pth")
+    print("Model saved to 'predictor.pth'")
+    
+    # Optional: Load and test later
+    # predictor.load_state_dict(torch.load("predictor.pth"))
     env.close()
 
 if __name__ == "__main__":
